@@ -1,6 +1,6 @@
-# news-extractor
+# pdf-translator
 
-Converts newspaper PDFs into translated HTML pages. For each page it produces:
+Converts PDFs into translated HTML pages. For each page it produces:
 
 - the original page image
 - a translated version with each text block replaced in-place
@@ -24,8 +24,8 @@ extracts/
     page_001.jpg          # all translated pages, sequential across all PDFs
     page_002.jpg
     ...
-  <paper>/
-    <issue>/
+  <source>/
+    <name>/
       index.html
       page_01.html        # original + translated images
       page_02.html
@@ -50,11 +50,11 @@ The NLLB model (~2.5 GB) is downloaded from Hugging Face on first run.
 ## Usage
 
 ```bash
-# Process all PDFs under news/
+# Process all PDFs under pdfs/
 uv run python extract.py
 
 # Process a single PDF
-uv run python extract.py news/the_globe_and_mail/issue.pdf
+uv run python extract.py pdfs/folder/file.pdf
 
 # Translate to French instead of Vietnamese
 uv run python extract.py --lang fr
@@ -90,12 +90,12 @@ Any [NLLB language token](https://huggingface.co/facebook/nllb-200-distilled-1.3
 
 ## Input layout
 
-Place PDFs under `news/<paper-name>/`:
+Place PDFs under `pdfs/<source-name>/`:
 
 ```
-news/
-  the_globe_and_mail/
-    issue.pdf
-  the_new_york_times/
-    issue.pdf
+pdfs/
+  folder_a/
+    file.pdf
+  folder_b/
+    file.pdf
 ```

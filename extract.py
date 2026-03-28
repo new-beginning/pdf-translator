@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Newspaper PDF → per-page HTML with original + Vietnamese translation overlay.
+PDF → per-page HTML with original + translated text overlay.
 
 For each page:
   1. Render the page to an image.
@@ -13,15 +13,15 @@ For each page:
   5. Write one HTML per page with both images stacked.
 
 Output layout:
-  extracts/<paper>/<issue>/
+  extracts/<source>/<name>/
     index.html
     page_01.html
     page_02.html
     ...
 
 Usage:
-    uv run python extract.py                        # all PDFs under news/
-    uv run python extract.py news/paper/issue.pdf   # one PDF
+    uv run python extract.py                        # all PDFs under pdfs/
+    uv run python extract.py pdfs/folder/file.pdf   # one PDF
     uv run python extract.py --dpi 200              # render resolution
 """
 
@@ -42,7 +42,7 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-NEWS_DIR        = Path("news")
+NEWS_DIR        = Path("pdfs")
 EXTRACTS_DIR    = Path("extracts")
 DEFAULT_DPI     = 200
 MIN_NATIVE_TEXT = 80      # chars — below this, treat page as image-only
@@ -604,10 +604,10 @@ def process_all(dpi: int, max_pages: int | None = None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract newspaper PDFs to translated overlay HTML"
+        description="Translate PDF pages with in-place text overlay"
     )
     parser.add_argument("pdfs", nargs="*",
-                        help="PDF file(s) to process (default: all under news/)")
+                        help="PDF file(s) to process (default: all under pdfs/)")
     parser.add_argument("--dpi", type=int, default=DEFAULT_DPI,
                         help=f"Render resolution (default: {DEFAULT_DPI})")
     parser.add_argument("--pages", type=int, default=None,

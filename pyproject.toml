@@ -1,7 +1,7 @@
 [project]
-name = "news-extractor"
+name = "pdf-translator"
 version = "0.1.0"
-description = "Extract articles from newspaper PDF scans into HTML"
+description = "Translate PDF pages into any language with in-place text overlay"
 requires-python = ">=3.13"
 dependencies = [
     "pymupdf>=1.24.0",
