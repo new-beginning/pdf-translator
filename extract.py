@@ -49,6 +49,25 @@ MIN_NATIVE_TEXT = 80      # chars — below this, treat page as image-only
 MODEL_NAME      = "facebook/nllb-200-distilled-1.3B"
 MAX_TOKENS      = 480
 
+# NLLB language token for the target language (set at startup via --lang).
+# Common codes: vie_Latn (Vietnamese), fra_Latn (French), zho_Hans (Simplified Chinese),
+#               deu_Latn (German), spa_Latn (Spanish), jpn_Jpan (Japanese)
+_target_lang_token: str = "vie_Latn"
+
+# Friendly short-code → NLLB token mapping for --lang convenience
+_LANG_MAP: dict[str, str] = {
+    "vi": "vie_Latn",
+    "fr": "fra_Latn",
+    "de": "deu_Latn",
+    "es": "spa_Latn",
+    "zh": "zho_Hans",
+    "ja": "jpn_Jpan",
+    "ko": "kor_Hang",
+    "ar": "arb_Arab",
+    "hi": "hin_Deva",
+    "pt": "por_Latn",
+}
+
 # Font for drawing Vietnamese text on the translated image.
 # Arial covers the full Vietnamese Unicode range.
 _FONT_CANDIDATES = [
@@ -65,8 +84,8 @@ _FONT_PATH: str | None = next((p for p in _FONT_CANDIDATES if os.path.exists(p))
 # Uses Apple MPS (GPU) when available, falls back to CPU.
 # ---------------------------------------------------------------------------
 
-_worker_tokenizer = None   # NllbTokenizerFast, src_lang="eng_Latn"
-_worker_model     = None   # AutoModelForSeq2SeqLM (NLLB-200 distilled 1.3B)
+_worker_tokenizer = None   # NllbTokenizerFast, src_lang="eng_Latn", loaded in main()
+_worker_model     = None   # AutoModelForSeq2SeqLM (NLLB-200 distilled 1.3B), loaded in main()
 
 
 def _chunk_text(text: str, tokenizer=None) -> list[str]:
@@ -97,7 +116,7 @@ def _run_batch(batch: list[str], tokenizer=None, model=None) -> list[str]:
     inputs  = tok(batch, return_tensors="pt", padding=True,
                   truncation=True, max_length=MAX_TOKENS)
     inputs  = {k: v.to(device) for k, v in inputs.items()}
-    vi_id   = tok.convert_tokens_to_ids("vie_Latn")
+    vi_id   = tok.convert_tokens_to_ids(_target_lang_token)
     outputs = mdl.generate(**inputs, forced_bos_token_id=vi_id)
     return [tok.decode(o, skip_special_tokens=True) for o in outputs]
 
@@ -585,7 +604,7 @@ def process_all(dpi: int, max_pages: int | None = None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract newspaper PDFs to English+Vietnamese overlay HTML"
+        description="Extract newspaper PDFs to translated overlay HTML"
     )
     parser.add_argument("pdfs", nargs="*",
                         help="PDF file(s) to process (default: all under news/)")
@@ -593,10 +612,16 @@ def main() -> None:
                         help=f"Render resolution (default: {DEFAULT_DPI})")
     parser.add_argument("--pages", type=int, default=None,
                         help="Only process the first N pages (default: all)")
+    parser.add_argument("--lang", default="vi",
+                        help="Target language: short code (vi, fr, de, es, zh, ja, ko, ar, "
+                             "hi, pt) or full NLLB token e.g. vie_Latn (default: vi)")
     args = parser.parse_args()
 
+    global _worker_tokenizer, _worker_model, _target_lang_token
+    _target_lang_token = _LANG_MAP.get(args.lang, args.lang)
+    print(f"Target language: {args.lang} → NLLB token: {_target_lang_token}", flush=True)
+
     # Load model — use MPS (Apple GPU) if available for fast inference
-    global _worker_tokenizer, _worker_model
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Loading {MODEL_NAME} on {device.upper()} …", flush=True)
     _worker_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang="eng_Latn")
