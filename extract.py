@@ -5,7 +5,7 @@ Newspaper PDF → per-page HTML with original + Vietnamese translation overlay.
 For each page:
   1. Render the page to an image.
   2. Extract text blocks with bounding boxes (native PDF text, or Tesseract OCR).
-  3. Translate each block individually to Vietnamese (Helsinki-NLP/opus-mt-en-vi).
+  3. Translate each block individually to Vietnamese (Meta NLLB-200 1.3B, via MPS).
   4. Produce two images:
        • Original page scan (unchanged)
        • Translated page: each text block region is whited out and redrawn
@@ -61,33 +61,12 @@ _FONT_PATH: str | None = next((p for p in _FONT_CANDIDATES if os.path.exists(p))
 
 
 # ---------------------------------------------------------------------------
-# Translation — loaded once, reused for every page
+# Translation — Meta NLLB-200 1.3B loaded once in main(), reused for every page
+# Uses Apple MPS (GPU) when available, falls back to CPU.
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Per-worker globals (each worker process loads its own model copy)
-# ---------------------------------------------------------------------------
-_worker_tokenizer = None
-_worker_model     = None
-
-
-def _worker_init(model_name: str, torch_threads: int) -> None:
-    """Initializer run once per worker process — loads model into process memory."""
-    global _worker_tokenizer, _worker_model
-    torch.set_num_threads(torch_threads)
-    _worker_tokenizer = MBart50TokenizerFast.from_pretrained(model_name, src_lang="en_XX")
-    _worker_model     = MBartForConditionalGeneration.from_pretrained(model_name)
-    _worker_model.eval()
-
-
-def load_translator():
-    """Used only in single-process mode."""
-    print(f"  [translator] Loading {MODEL_NAME} …", flush=True)
-    tok   = MBart50TokenizerFast.from_pretrained(MODEL_NAME, src_lang="en_XX")
-    model = MBartForConditionalGeneration.from_pretrained(MODEL_NAME)
-    model.eval()
-    print("  [translator] Ready.", flush=True)
-    return tok, model
+_worker_tokenizer = None   # NllbTokenizerFast, src_lang="eng_Latn"
+_worker_model     = None   # AutoModelForSeq2SeqLM (NLLB-200 distilled 1.3B)
 
 
 def _chunk_text(text: str, tokenizer=None) -> list[str]:
