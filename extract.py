@@ -548,8 +548,7 @@ def _process_page_worker(args: tuple) -> tuple[int, bytes, bytes]:
 
 def process_pdf(pdf_path: Path, output_dir: Path, dpi: int,
                 max_pages: int | None = None,
-                flat_dir: Path | None = None,
-                flat_counter: list[int] | None = None) -> None:
+                flat_dir: Path | None = None) -> None:
     paper = pdf_path.parent.name
     issue = pdf_path.stem
     print(f"\n[{paper}] {issue}")
@@ -581,10 +580,10 @@ def process_pdf(pdf_path: Path, output_dir: Path, dpi: int,
         html  = build_page_html(page_img, translated_img, paper, issue, page_num, page_count)
         (output_dir / f"{label}.html").write_text(html, encoding="utf-8")
 
-        if flat_dir is not None and flat_counter is not None:
-            flat_name = f"page_{flat_counter[0]:03d}.jpg"
-            translated_img.save(flat_dir / flat_name, format="JPEG", quality=85)
-            flat_counter[0] += 1
+        if flat_dir is not None:
+            flat_issue_dir = flat_dir / paper / issue
+            flat_issue_dir.mkdir(parents=True, exist_ok=True)
+            translated_img.save(flat_issue_dir / f"{label}.jpg", format="JPEG", quality=85)
 
         page_sec = time.perf_counter() - t_page_start
         tok_in_s  = _total_tokens_in  / _total_infer_sec if _total_infer_sec else 0
@@ -609,15 +608,13 @@ def process_all(dpi: int, max_pages: int | None = None) -> None:
     EXTRACTS_DIR.mkdir(exist_ok=True)
     flat_dir = EXTRACTS_DIR / "flat"
     flat_dir.mkdir(exist_ok=True)
-    flat_counter = [1]
     pdfs = sorted(NEWS_DIR.glob("**/*.pdf"))
     if not pdfs:
         sys.exit(f"No PDF files found under '{NEWS_DIR}'")
     for pdf_path in pdfs:
         issue_dir = EXTRACTS_DIR / pdf_path.parent.name / pdf_path.stem
-        process_pdf(pdf_path, issue_dir, dpi, max_pages=max_pages,
-                    flat_dir=flat_dir, flat_counter=flat_counter)
-    print(f"\nFlat folder: {flat_counter[0]-1} pages → {flat_dir}")
+        process_pdf(pdf_path, issue_dir, dpi, max_pages=max_pages, flat_dir=flat_dir)
+    print(f"\nFlat folder → {flat_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +652,6 @@ def main() -> None:
         EXTRACTS_DIR.mkdir(exist_ok=True)
         flat_dir = EXTRACTS_DIR / "flat"
         flat_dir.mkdir(exist_ok=True)
-        flat_counter = [1]
         for path_str in args.pdfs:
             pdf_path = Path(path_str)
             if not pdf_path.exists():
@@ -663,8 +659,8 @@ def main() -> None:
                 continue
             issue_dir = EXTRACTS_DIR / pdf_path.parent.name / pdf_path.stem
             process_pdf(pdf_path, issue_dir, args.dpi, max_pages=args.pages,
-                        flat_dir=flat_dir, flat_counter=flat_counter)
-        print(f"\nFlat folder: {flat_counter[0]-1} pages → {flat_dir}")
+                        flat_dir=flat_dir)
+        print(f"\nFlat folder → {flat_dir}")
     else:
         process_all(args.dpi, args.pages)
 
