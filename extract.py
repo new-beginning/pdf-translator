@@ -29,6 +29,7 @@ import argparse
 import base64
 import os
 import sys
+import time
 import multiprocessing as mp
 from io import BytesIO
 from pathlib import Path
@@ -87,6 +88,11 @@ _FONT_PATH: str | None = next((p for p in _FONT_CANDIDATES if os.path.exists(p))
 _worker_tokenizer = None   # NllbTokenizerFast, src_lang="eng_Latn", loaded in main()
 _worker_model     = None   # AutoModelForSeq2SeqLM (NLLB-200 distilled 1.3B), loaded in main()
 
+# Token throughput tracking (updated by _run_batch, printed per page)
+_total_tokens_in  = 0
+_total_tokens_out = 0
+_total_infer_sec  = 0.0
+
 
 def _chunk_text(text: str, tokenizer=None) -> list[str]:
     """Split text into chunks that fit within MAX_TOKENS (word-level split)."""
@@ -110,6 +116,7 @@ BATCH_SIZE = 16   # mini-batch size; balances parallelism vs padding overhead
 
 def _run_batch(batch: list[str], tokenizer=None, model=None) -> list[str]:
     """Run one mini-batch through the model. Uses worker globals if not passed."""
+    global _total_tokens_in, _total_tokens_out, _total_infer_sec
     tok    = tokenizer or _worker_tokenizer
     mdl    = model     or _worker_model
     device = next(mdl.parameters()).device
@@ -117,7 +124,11 @@ def _run_batch(batch: list[str], tokenizer=None, model=None) -> list[str]:
                   truncation=True, max_length=MAX_TOKENS)
     inputs  = {k: v.to(device) for k, v in inputs.items()}
     vi_id   = tok.convert_tokens_to_ids(_target_lang_token)
+    t0      = time.perf_counter()
     outputs = mdl.generate(**inputs, forced_bos_token_id=vi_id)
+    _total_infer_sec  += time.perf_counter() - t0
+    _total_tokens_in  += int(inputs["input_ids"].numel())
+    _total_tokens_out += int(outputs.numel())
     return [tok.decode(o, skip_special_tokens=True) for o in outputs]
 
 
@@ -328,6 +339,8 @@ def _draw_text_in_box(draw: ImageDraw.ImageDraw, text: str,
     White out px_bbox then draw text inside it, shrinking font until it fits.
     """
     x0, y0, x1, y1 = px_bbox
+    if y1 < y0:
+        y0, y1 = y1, y0
     box_w = x1 - x0
     box_h = y1 - y0
 
@@ -557,6 +570,7 @@ def process_pdf(pdf_path: Path, output_dir: Path, dpi: int,
             blocks = native_blocks(page, dpi)
             method = f"{len(blocks)}blk"
 
+        t_page_start = time.perf_counter()
         print(f"  page_{page_num+1:02d}/{page_count} [{method}]", end="", flush=True)
         vi_texts = translate_blocks_batch([b["text"] for b in blocks])
         for block, vi in zip(blocks, vi_texts):
@@ -572,13 +586,21 @@ def process_pdf(pdf_path: Path, output_dir: Path, dpi: int,
             translated_img.save(flat_dir / flat_name, format="JPEG", quality=85)
             flat_counter[0] += 1
 
-        print(" ✓")
+        page_sec = time.perf_counter() - t_page_start
+        tok_in_s  = _total_tokens_in  / _total_infer_sec if _total_infer_sec else 0
+        tok_out_s = _total_tokens_out / _total_infer_sec if _total_infer_sec else 0
+        print(f" ✓  {page_sec:.1f}s  [{tok_in_s:.0f} tok_in/s  {tok_out_s:.0f} tok_out/s]")
 
     doc.close()
     (output_dir / "index.html").write_text(
         build_index(issue, paper, page_count), encoding="utf-8"
     )
+    tok_in_s  = _total_tokens_in  / _total_infer_sec if _total_infer_sec else 0
+    tok_out_s = _total_tokens_out / _total_infer_sec if _total_infer_sec else 0
     print(f"  → {page_count} pages → {output_dir}")
+    print(f"  tokens — in: {_total_tokens_in:,}  out: {_total_tokens_out:,}  "
+          f"infer: {_total_infer_sec:.1f}s  "
+          f"[{tok_in_s:.0f} tok_in/s  {tok_out_s:.0f} tok_out/s]")
 
 
 def process_all(dpi: int, max_pages: int | None = None) -> None:

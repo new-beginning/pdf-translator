@@ -32,6 +32,16 @@ extracts/
       ...
 ```
 
+## Benchmarks
+
+| Machine | PDF | Pages | DPI | Model | Wall time | Sec/page |
+|---------|-----|-------|-----|-------|-----------|----------|
+| MacBook Pro M2 Pro, 32 GB | The Globe and Mail — Mar 28 2026 | 80 | 200 | NLLB-200 1.3B (MPS) | 39m 10s | ~29.4s |
+
+**Machine spec (M2 Pro run):** MacBook Pro 14" (Mac14,10) · Apple M2 Pro · 12 CPU cores (8P + 4E) · 19 GPU cores · 32 GB unified memory · Apple MPS
+
+CPU utilisation during run: ~30% (model inference is GPU-bound via MPS).
+
 ## Requirements
 
 - Python 3.13+
