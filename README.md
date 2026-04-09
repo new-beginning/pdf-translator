@@ -34,13 +34,17 @@ extracts/
 
 ## Benchmarks
 
-| Machine | PDF | Pages | DPI | Model | Wall time | Sec/page |
-|---------|-----|-------|-----|-------|-----------|----------|
-| MacBook Pro M2 Pro, 32 GB | The Globe and Mail — Mar 28 2026 | 80 | 200 | NLLB-200 1.3B (MPS) | 39m 10s | ~29.4s |
+**Machine:** MacBook Pro 14" (Mac14,10) · Apple M2 Pro · 12 CPU cores (8P + 4E) · 19 GPU cores · 32 GB unified memory · macOS 26
 
-**Machine spec (M2 Pro run):** MacBook Pro 14" (Mac14,10) · Apple M2 Pro · 12 CPU cores (8P + 4E) · 19 GPU cores · 32 GB unified memory · Apple MPS
+| Backend | PDF | Pages | DPI | Wall time | Sec/page | Notes |
+|---------|-----|-------|-----|-----------|----------|-------|
+| NLLB-200 1.3B (MPS) | Globe and Mail — Mar 28 2026 | 80 | 200 | 39m 10s | ~29.4s | Native text |
+| NLLB-200 1.3B (MPS) | Globe and Mail — Mar 30 2026 | 32 | 200 | 16m 29s | ~30.9s | Native text |
+| NLLB-200 1.3B (MPS) | NYT — Mar 28 2026 | 36 | 200 | 28m 35s | ~47.6s | All OCR · 141 tok_in/s |
+| NLLB-200 1.3B (MPS) | NYT — Mar 29 2026 | 102 | 200 | 71m 03s | ~41.8s | All OCR · 163 tok_in/s |
+| Apple Translation | Globe and Mail — Mar 30 2026 | 32 | 200 | **3m 19s** | **~6.2s** | Native text · **4.9× faster** |
 
-CPU utilisation during run: ~30% (model inference is GPU-bound via MPS).
+**Apple Translation backend** (`--backend apple`) uses Apple's on-device Translation framework (macOS 15+). Requires the target language pack to be installed via **System Settings → General → Language & Region → Translation Languages**. Vietnamese is supported.
 
 ## Requirements
 
@@ -71,6 +75,9 @@ uv run python extract.py --lang fr
 
 # First 5 pages only, at 300 DPI
 uv run python extract.py --pages 5 --dpi 300
+
+# Use Apple Translation (macOS 15+, ~5x faster, requires language pack installed)
+uv run python extract.py --backend apple pdfs/folder/file.pdf
 ```
 
 ## Options
@@ -80,6 +87,7 @@ uv run python extract.py --pages 5 --dpi 300
 | `--lang` | `vi` | Target language (see below) |
 | `--dpi` | `200` | Page render resolution |
 | `--pages` | all | Limit to first N pages |
+| `--backend` | `nllb` | `nllb` (default) or `apple` (Translation.framework, macOS 15+) |
 
 ### Supported languages
 

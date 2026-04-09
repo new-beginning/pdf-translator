@@ -56,7 +56,8 @@ MAX_TOKENS      = 480
 # Common codes: vie_Latn (Vietnamese), fra_Latn (French), zho_Hans (Simplified Chinese),
 #               deu_Latn (German), spa_Latn (Spanish), jpn_Jpan (Japanese)
 _target_lang_token: str = "vie_Latn"
-_target_lang_name:  str = "Vietnamese"   # human-readable, used by Apple backend
+_target_lang_name:  str = "Vietnamese"   # human-readable (display only)
+_target_lang_code:  str = "vi"           # BCP-47 short code, used by Apple backend
 _backend:           str = "nllb"         # "nllb" | "apple"
 
 # Friendly short-code → NLLB token mapping for --lang convenience
@@ -139,28 +140,26 @@ def _ensure_apple_binary() -> None:
 
 
 class AppleTranslator:
-    """Long-lived subprocess communicating over line-delimited JSON."""
+    """Spawns a fresh one-shot subprocess per page to avoid main-thread deadlocks
+    in the Translation framework. Startup overhead is ~0.1s per page."""
 
     def __init__(self) -> None:
         _ensure_apple_binary()
-        self._proc = subprocess.Popen(
-            [str(_APPLE_TRANSLATE_BIN)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            text=True, bufsize=1,
-        )
 
     def translate(self, texts: list[str]) -> list[str]:
         if not texts:
             return []
-        self._proc.stdin.write(
-            json.dumps({"texts": texts, "target": _target_lang_name}) + "\n"
+        payload = json.dumps({"texts": texts, "source": "en", "target": _target_lang_code})
+        result = subprocess.run(
+            [str(_APPLE_TRANSLATE_BIN)],
+            input=payload, capture_output=True, text=True,
         )
-        self._proc.stdin.flush()
-        return json.loads(self._proc.stdout.readline())["translations"]
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError(f"apple_translate failed: {result.stderr}")
+        return json.loads(result.stdout)["translations"]
 
     def close(self) -> None:
-        self._proc.stdin.close()
-        self._proc.wait()
+        pass
 
 
 _apple_translator: AppleTranslator | None = None
@@ -719,9 +718,10 @@ def main() -> None:
     args = parser.parse_args()
 
     global _worker_tokenizer, _worker_model, _target_lang_token, \
-           _target_lang_name, _backend, _apple_translator
+           _target_lang_name, _target_lang_code, _backend, _apple_translator
     _target_lang_token = _LANG_MAP.get(args.lang, args.lang)
     _target_lang_name  = _LANG_NAMES.get(args.lang, args.lang)
+    _target_lang_code  = args.lang
     _backend           = args.backend
 
     print(f"Target language : {args.lang} ({_target_lang_name})", flush=True)
