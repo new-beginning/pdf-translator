@@ -27,7 +27,9 @@ Usage:
 
 import argparse
 import base64
+import json
 import os
+import subprocess
 import sys
 import time
 import multiprocessing as mp
@@ -54,6 +56,8 @@ MAX_TOKENS      = 480
 # Common codes: vie_Latn (Vietnamese), fra_Latn (French), zho_Hans (Simplified Chinese),
 #               deu_Latn (German), spa_Latn (Spanish), jpn_Jpan (Japanese)
 _target_lang_token: str = "vie_Latn"
+_target_lang_name:  str = "Vietnamese"   # human-readable, used by Apple backend
+_backend:           str = "nllb"         # "nllb" | "apple"
 
 # Friendly short-code → NLLB token mapping for --lang convenience
 _LANG_MAP: dict[str, str] = {
@@ -67,6 +71,20 @@ _LANG_MAP: dict[str, str] = {
     "ar": "arb_Arab",
     "hi": "hin_Deva",
     "pt": "por_Latn",
+}
+
+# Short-code → human-readable name (used by Apple Foundation Models backend)
+_LANG_NAMES: dict[str, str] = {
+    "vi": "Vietnamese",
+    "fr": "French",
+    "de": "German",
+    "es": "Spanish",
+    "zh": "Simplified Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "ar": "Arabic",
+    "hi": "Hindi",
+    "pt": "Portuguese",
 }
 
 # Font for drawing Vietnamese text on the translated image.
@@ -92,6 +110,60 @@ _worker_model     = None   # AutoModelForSeq2SeqLM (NLLB-200 distilled 1.3B), lo
 _total_tokens_in  = 0
 _total_tokens_out = 0
 _total_infer_sec  = 0.0
+
+# ---------------------------------------------------------------------------
+# Apple Foundation Models backend
+# Requires macOS 26+. apple_translate.swift compiled to .apple_translate on
+# first use and kept as a long-lived subprocess for the duration of the run.
+# ---------------------------------------------------------------------------
+
+_APPLE_TRANSLATE_SRC = Path(__file__).parent / "apple_translate.swift"
+_APPLE_TRANSLATE_BIN = Path(__file__).parent / ".apple_translate"
+
+
+def _ensure_apple_binary() -> None:
+    src_mtime = _APPLE_TRANSLATE_SRC.stat().st_mtime if _APPLE_TRANSLATE_SRC.exists() else 0
+    bin_mtime = _APPLE_TRANSLATE_BIN.stat().st_mtime if _APPLE_TRANSLATE_BIN.exists() else 0
+    if _APPLE_TRANSLATE_BIN.exists() and bin_mtime >= src_mtime:
+        return
+    if not _APPLE_TRANSLATE_SRC.exists():
+        sys.exit(f"Error: {_APPLE_TRANSLATE_SRC} not found")
+    print("Compiling apple_translate.swift …", flush=True)
+    r = subprocess.run(
+        ["swiftc", "-O", str(_APPLE_TRANSLATE_SRC), "-o", str(_APPLE_TRANSLATE_BIN)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        sys.exit(f"swiftc failed:\n{r.stderr}")
+    print("Compiled.", flush=True)
+
+
+class AppleTranslator:
+    """Long-lived subprocess communicating over line-delimited JSON."""
+
+    def __init__(self) -> None:
+        _ensure_apple_binary()
+        self._proc = subprocess.Popen(
+            [str(_APPLE_TRANSLATE_BIN)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+
+    def translate(self, texts: list[str]) -> list[str]:
+        if not texts:
+            return []
+        self._proc.stdin.write(
+            json.dumps({"texts": texts, "target": _target_lang_name}) + "\n"
+        )
+        self._proc.stdin.flush()
+        return json.loads(self._proc.stdout.readline())["translations"]
+
+    def close(self) -> None:
+        self._proc.stdin.close()
+        self._proc.wait()
+
+
+_apple_translator: AppleTranslator | None = None
 
 
 def _chunk_text(text: str, tokenizer=None) -> list[str]:
@@ -571,7 +643,10 @@ def process_pdf(pdf_path: Path, output_dir: Path, dpi: int,
 
         t_page_start = time.perf_counter()
         print(f"  page_{page_num+1:02d}/{page_count} [{method}]", end="", flush=True)
-        vi_texts = translate_blocks_batch([b["text"] for b in blocks])
+        if _backend == "apple":
+            vi_texts = _apple_translator.translate([b["text"] for b in blocks])
+        else:
+            vi_texts = translate_blocks_batch([b["text"] for b in blocks])
         for block, vi in zip(blocks, vi_texts):
             block["vi_text"] = vi
 
@@ -586,20 +661,24 @@ def process_pdf(pdf_path: Path, output_dir: Path, dpi: int,
             translated_img.save(flat_issue_dir / f"{label}.jpg", format="JPEG", quality=85)
 
         page_sec = time.perf_counter() - t_page_start
-        tok_in_s  = _total_tokens_in  / _total_infer_sec if _total_infer_sec else 0
-        tok_out_s = _total_tokens_out / _total_infer_sec if _total_infer_sec else 0
-        print(f" ✓  {page_sec:.1f}s  [{tok_in_s:.0f} tok_in/s  {tok_out_s:.0f} tok_out/s]")
+        if _backend == "nllb":
+            tok_in_s  = _total_tokens_in  / _total_infer_sec if _total_infer_sec else 0
+            tok_out_s = _total_tokens_out / _total_infer_sec if _total_infer_sec else 0
+            print(f" ✓  {page_sec:.1f}s  [{tok_in_s:.0f} tok_in/s  {tok_out_s:.0f} tok_out/s]")
+        else:
+            print(f" ✓  {page_sec:.1f}s")
 
     doc.close()
     (output_dir / "index.html").write_text(
         build_index(issue, paper, page_count), encoding="utf-8"
     )
-    tok_in_s  = _total_tokens_in  / _total_infer_sec if _total_infer_sec else 0
-    tok_out_s = _total_tokens_out / _total_infer_sec if _total_infer_sec else 0
     print(f"  → {page_count} pages → {output_dir}")
-    print(f"  tokens — in: {_total_tokens_in:,}  out: {_total_tokens_out:,}  "
-          f"infer: {_total_infer_sec:.1f}s  "
-          f"[{tok_in_s:.0f} tok_in/s  {tok_out_s:.0f} tok_out/s]")
+    if _backend == "nllb":
+        tok_in_s  = _total_tokens_in  / _total_infer_sec if _total_infer_sec else 0
+        tok_out_s = _total_tokens_out / _total_infer_sec if _total_infer_sec else 0
+        print(f"  tokens — in: {_total_tokens_in:,}  out: {_total_tokens_out:,}  "
+              f"infer: {_total_infer_sec:.1f}s  "
+              f"[{tok_in_s:.0f} tok_in/s  {tok_out_s:.0f} tok_out/s]")
 
 
 def process_all(dpi: int, max_pages: int | None = None) -> None:
@@ -634,35 +713,51 @@ def main() -> None:
     parser.add_argument("--lang", default="vi",
                         help="Target language: short code (vi, fr, de, es, zh, ja, ko, ar, "
                              "hi, pt) or full NLLB token e.g. vie_Latn (default: vi)")
+    parser.add_argument("--backend", choices=["nllb", "apple"], default="nllb",
+                        help="Translation backend: nllb (default, NLLB-200 1.3B via MPS) or "
+                             "apple (Foundation Models, requires macOS 26+)")
     args = parser.parse_args()
 
-    global _worker_tokenizer, _worker_model, _target_lang_token
+    global _worker_tokenizer, _worker_model, _target_lang_token, \
+           _target_lang_name, _backend, _apple_translator
     _target_lang_token = _LANG_MAP.get(args.lang, args.lang)
-    print(f"Target language: {args.lang} → NLLB token: {_target_lang_token}", flush=True)
+    _target_lang_name  = _LANG_NAMES.get(args.lang, args.lang)
+    _backend           = args.backend
 
-    # Load model — use MPS (Apple GPU) if available for fast inference
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Loading {MODEL_NAME} on {device.upper()} …", flush=True)
-    _worker_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang="eng_Latn")
-    _worker_model     = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
-    _worker_model.eval()
-    print("Model ready.", flush=True)
+    print(f"Target language : {args.lang} ({_target_lang_name})", flush=True)
+    print(f"Backend         : {_backend}", flush=True)
 
-    if args.pdfs:
-        EXTRACTS_DIR.mkdir(exist_ok=True)
-        flat_dir = EXTRACTS_DIR / "flat"
-        flat_dir.mkdir(exist_ok=True)
-        for path_str in args.pdfs:
-            pdf_path = Path(path_str)
-            if not pdf_path.exists():
-                print(f"Warning: {pdf_path} not found, skipping")
-                continue
-            issue_dir = EXTRACTS_DIR / pdf_path.parent.name / pdf_path.stem
-            process_pdf(pdf_path, issue_dir, args.dpi, max_pages=args.pages,
-                        flat_dir=flat_dir)
-        print(f"\nFlat folder → {flat_dir}")
+    if _backend == "nllb":
+        # Load model — use MPS (Apple GPU) if available for fast inference
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        print(f"Loading {MODEL_NAME} on {device.upper()} …", flush=True)
+        _worker_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang="eng_Latn")
+        _worker_model     = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+        _worker_model.eval()
+        print("Model ready.", flush=True)
     else:
-        process_all(args.dpi, args.pages)
+        _apple_translator = AppleTranslator()
+        print("Apple translator ready.", flush=True)
+
+    try:
+        if args.pdfs:
+            EXTRACTS_DIR.mkdir(exist_ok=True)
+            flat_dir = EXTRACTS_DIR / "flat"
+            flat_dir.mkdir(exist_ok=True)
+            for path_str in args.pdfs:
+                pdf_path = Path(path_str)
+                if not pdf_path.exists():
+                    print(f"Warning: {pdf_path} not found, skipping")
+                    continue
+                issue_dir = EXTRACTS_DIR / pdf_path.parent.name / pdf_path.stem
+                process_pdf(pdf_path, issue_dir, args.dpi, max_pages=args.pages,
+                            flat_dir=flat_dir)
+            print(f"\nFlat folder → {flat_dir}")
+        else:
+            process_all(args.dpi, args.pages)
+    finally:
+        if _apple_translator is not None:
+            _apple_translator.close()
 
 
 if __name__ == "__main__":

@@ -15,5 +15,8 @@ wheels/
 extracts/
 pdfs/
 
+# Compiled Apple translate binary
+.apple_translate
+
 # Virtual environments
 .venv
