@@ -29,10 +29,12 @@ import argparse
 import base64
 import json
 import os
+import queue
 import subprocess
 import sys
 import time
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 
@@ -140,29 +142,62 @@ def _ensure_apple_binary() -> None:
 
 
 class AppleTranslator:
-    """Spawns a fresh one-shot subprocess per page to avoid main-thread deadlocks
-    in the Translation framework. Startup overhead is ~0.1s per page."""
+    """Persistent subprocess — one TranslationSession reused for all pages.
+    Uses translate(batch:) to send all blocks in one round-trip per page."""
 
     def __init__(self) -> None:
         _ensure_apple_binary()
+        self._proc = subprocess.Popen(
+            [str(_APPLE_TRANSLATE_BIN)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
 
     def translate(self, texts: list[str]) -> list[str]:
         if not texts:
             return []
         payload = json.dumps({"texts": texts, "source": "en", "target": _target_lang_code})
-        result = subprocess.run(
-            [str(_APPLE_TRANSLATE_BIN)],
-            input=payload, capture_output=True, text=True,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            raise RuntimeError(f"apple_translate failed: {result.stderr}")
-        return json.loads(result.stdout)["translations"]
+        self._proc.stdin.write(payload + "\n")
+        self._proc.stdin.flush()
+        line = self._proc.stdout.readline()
+        if not line:
+            raise RuntimeError("apple_translate: process exited unexpectedly")
+        return json.loads(line)["translations"]
 
     def close(self) -> None:
-        pass
+        if self._proc.poll() is None:
+            self._proc.stdin.close()
+            self._proc.wait()
 
 
-_apple_translator: AppleTranslator | None = None
+class AppleTranslatorPool:
+    """Pool of N persistent AppleTranslator subprocesses for parallel page processing.
+    Thread-safe: each thread checks out a translator, uses it, then returns it."""
+
+    def __init__(self, size: int) -> None:
+        print(f"Starting {size} Apple translator workers …", flush=True)
+        self._pool: queue.Queue[AppleTranslator] = queue.Queue()
+        for _ in range(size):
+            self._pool.put(AppleTranslator())
+
+    def translate(self, texts: list[str]) -> list[str]:
+        translator = self._pool.get()
+        try:
+            return translator.translate(texts)
+        finally:
+            self._pool.put(translator)
+
+    def close(self) -> None:
+        while True:
+            try:
+                self._pool.get_nowait().close()
+            except queue.Empty:
+                break
+
+
+_apple_translator: AppleTranslator | AppleTranslatorPool | None = None
 
 
 def _chunk_text(text: str, tokenizer=None) -> list[str]:
@@ -583,11 +618,10 @@ def build_index(issue: str, paper: str, page_count: int) -> str:
 # Core pipeline
 # ---------------------------------------------------------------------------
 
-def _process_page_worker(args: tuple) -> tuple[int, bytes, bytes]:
+def _process_page_worker(args: tuple) -> tuple:
     """
-    Worker function — runs in a child process that already has the model loaded.
-    Returns (page_num, original_jpeg_bytes, translated_jpeg_bytes).
-    Images are serialised as JPEG bytes so they can cross the process boundary.
+    Worker — each thread/process opens its own fitz.Document (thread-safe).
+    Returns (page_num, method, page_sec, page_img, translated_img).
     """
     page_num, pdf_path_str, page_count, dpi = args
     doc      = fitz.open(pdf_path_str)
@@ -602,24 +636,25 @@ def _process_page_worker(args: tuple) -> tuple[int, bytes, bytes]:
         method = f"{len(blocks)}blk"
     doc.close()
 
-    vi_texts = translate_blocks_batch([b["text"] for b in blocks])
+    t0 = time.perf_counter()
+    if _backend == "apple":
+        vi_texts = _apple_translator.translate([b["text"] for b in blocks])
+    else:
+        vi_texts = translate_blocks_batch([b["text"] for b in blocks])
     for block, vi in zip(blocks, vi_texts):
         block["vi_text"] = vi
+    page_sec = time.perf_counter() - t0
 
     translated_img = build_translated_image(page_img, blocks)
-    print(f"  page_{page_num+1:02d}/{page_count} [{method}] ✓", flush=True)
+    print(f"  page_{page_num+1:02d}/{page_count} [{method}] ✓  {page_sec:.1f}s", flush=True)
 
-    def to_bytes(img):
-        buf = BytesIO()
-        img.save(buf, format="JPEG", quality=85, optimize=True)
-        return buf.getvalue()
-
-    return page_num, to_bytes(page_img), to_bytes(translated_img)
+    return page_num, method, page_sec, page_img, translated_img
 
 
 def process_pdf(pdf_path: Path, output_dir: Path, dpi: int,
                 max_pages: int | None = None,
-                flat_dir: Path | None = None) -> None:
+                flat_dir: Path | None = None,
+                workers: int = 1) -> None:
     paper = pdf_path.parent.name
     issue = pdf_path.stem
     print(f"\n[{paper}] {issue}")
@@ -628,46 +663,63 @@ def process_pdf(pdf_path: Path, output_dir: Path, dpi: int,
     doc        = fitz.open(str(pdf_path))
     page_count = min(len(doc), max_pages) if max_pages else len(doc)
 
-    for page_num in range(page_count):
-        page     = doc[page_num]
-        page_img = render_page(page, dpi)
-        all_text = page.get_text("text")
+    if workers > 1 and _backend == "apple":
+        # Parallel path — each worker opens its own fitz.Document
+        doc.close()
+        page_args = [(pn, str(pdf_path), page_count, dpi) for pn in range(page_count)]
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_process_page_worker, a): a[0] for a in page_args}
+            for future in as_completed(futures):
+                page_num, method, page_sec, page_img, translated_img = future.result()
+                label = f"page_{page_num + 1:02d}"
+                html  = build_page_html(page_img, translated_img, paper, issue, page_num, page_count)
+                (output_dir / f"{label}.html").write_text(html, encoding="utf-8")
+                if flat_dir is not None:
+                    flat_issue_dir = flat_dir / paper / issue
+                    flat_issue_dir.mkdir(parents=True, exist_ok=True)
+                    translated_img.save(flat_issue_dir / f"{label}.jpg", format="JPEG", quality=85)
+    else:
+        # Sequential path
+        for page_num in range(page_count):
+            page     = doc[page_num]
+            page_img = render_page(page, dpi)
+            all_text = page.get_text("text")
 
-        if len(all_text.strip()) < MIN_NATIVE_TEXT:
-            blocks = ocr_blocks(page_img, dpi)
-            method = "OCR"
-        else:
-            blocks = native_blocks(page, dpi)
-            method = f"{len(blocks)}blk"
+            if len(all_text.strip()) < MIN_NATIVE_TEXT:
+                blocks = ocr_blocks(page_img, dpi)
+                method = "OCR"
+            else:
+                blocks = native_blocks(page, dpi)
+                method = f"{len(blocks)}blk"
 
-        t_page_start = time.perf_counter()
-        print(f"  page_{page_num+1:02d}/{page_count} [{method}]", end="", flush=True)
-        if _backend == "apple":
-            vi_texts = _apple_translator.translate([b["text"] for b in blocks])
-        else:
-            vi_texts = translate_blocks_batch([b["text"] for b in blocks])
-        for block, vi in zip(blocks, vi_texts):
-            block["vi_text"] = vi
+            t_page_start = time.perf_counter()
+            print(f"  page_{page_num+1:02d}/{page_count} [{method}]", end="", flush=True)
+            if _backend == "apple":
+                vi_texts = _apple_translator.translate([b["text"] for b in blocks])
+            else:
+                vi_texts = translate_blocks_batch([b["text"] for b in blocks])
+            for block, vi in zip(blocks, vi_texts):
+                block["vi_text"] = vi
 
-        translated_img = build_translated_image(page_img, blocks)
-        label = f"page_{page_num + 1:02d}"
-        html  = build_page_html(page_img, translated_img, paper, issue, page_num, page_count)
-        (output_dir / f"{label}.html").write_text(html, encoding="utf-8")
+            translated_img = build_translated_image(page_img, blocks)
+            label = f"page_{page_num + 1:02d}"
+            html  = build_page_html(page_img, translated_img, paper, issue, page_num, page_count)
+            (output_dir / f"{label}.html").write_text(html, encoding="utf-8")
 
-        if flat_dir is not None:
-            flat_issue_dir = flat_dir / paper / issue
-            flat_issue_dir.mkdir(parents=True, exist_ok=True)
-            translated_img.save(flat_issue_dir / f"{label}.jpg", format="JPEG", quality=85)
+            if flat_dir is not None:
+                flat_issue_dir = flat_dir / paper / issue
+                flat_issue_dir.mkdir(parents=True, exist_ok=True)
+                translated_img.save(flat_issue_dir / f"{label}.jpg", format="JPEG", quality=85)
 
-        page_sec = time.perf_counter() - t_page_start
-        if _backend == "nllb":
-            tok_in_s  = _total_tokens_in  / _total_infer_sec if _total_infer_sec else 0
-            tok_out_s = _total_tokens_out / _total_infer_sec if _total_infer_sec else 0
-            print(f" ✓  {page_sec:.1f}s  [{tok_in_s:.0f} tok_in/s  {tok_out_s:.0f} tok_out/s]")
-        else:
-            print(f" ✓  {page_sec:.1f}s")
+            page_sec = time.perf_counter() - t_page_start
+            if _backend == "nllb":
+                tok_in_s  = _total_tokens_in  / _total_infer_sec if _total_infer_sec else 0
+                tok_out_s = _total_tokens_out / _total_infer_sec if _total_infer_sec else 0
+                print(f" ✓  {page_sec:.1f}s  [{tok_in_s:.0f} tok_in/s  {tok_out_s:.0f} tok_out/s]")
+            else:
+                print(f" ✓  {page_sec:.1f}s")
+        doc.close()
 
-    doc.close()
     (output_dir / "index.html").write_text(
         build_index(issue, paper, page_count), encoding="utf-8"
     )
@@ -680,7 +732,7 @@ def process_pdf(pdf_path: Path, output_dir: Path, dpi: int,
               f"[{tok_in_s:.0f} tok_in/s  {tok_out_s:.0f} tok_out/s]")
 
 
-def process_all(dpi: int, max_pages: int | None = None) -> None:
+def process_all(dpi: int, max_pages: int | None = None, workers: int = 1) -> None:
     if not NEWS_DIR.exists():
         sys.exit(f"Error: '{NEWS_DIR}' directory not found")
     EXTRACTS_DIR.mkdir(exist_ok=True)
@@ -691,7 +743,8 @@ def process_all(dpi: int, max_pages: int | None = None) -> None:
         sys.exit(f"No PDF files found under '{NEWS_DIR}'")
     for pdf_path in pdfs:
         issue_dir = EXTRACTS_DIR / pdf_path.parent.name / pdf_path.stem
-        process_pdf(pdf_path, issue_dir, dpi, max_pages=max_pages, flat_dir=flat_dir)
+        process_pdf(pdf_path, issue_dir, dpi, max_pages=max_pages, flat_dir=flat_dir,
+                    workers=workers)
     print(f"\nFlat folder → {flat_dir}")
 
 
@@ -715,7 +768,12 @@ def main() -> None:
     parser.add_argument("--backend", choices=["nllb", "apple"], default="nllb",
                         help="Translation backend: nllb (default, NLLB-200 1.3B via MPS) or "
                              "apple (Foundation Models, requires macOS 26+)")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Parallel page workers (default: 2 for apple, 1 for nllb). "
+                             "Apple Translation daemon saturates at ~2 concurrent sessions.")
     args = parser.parse_args()
+
+    workers = args.workers if args.workers is not None else (2 if args.backend == "apple" else 1)
 
     global _worker_tokenizer, _worker_model, _target_lang_token, \
            _target_lang_name, _target_lang_code, _backend, _apple_translator
@@ -725,7 +783,7 @@ def main() -> None:
     _backend           = args.backend
 
     print(f"Target language : {args.lang} ({_target_lang_name})", flush=True)
-    print(f"Backend         : {_backend}", flush=True)
+    print(f"Backend         : {_backend}  workers={workers}", flush=True)
 
     if _backend == "nllb":
         # Load model — use MPS (Apple GPU) if available for fast inference
@@ -736,7 +794,10 @@ def main() -> None:
         _worker_model.eval()
         print("Model ready.", flush=True)
     else:
-        _apple_translator = AppleTranslator()
+        if workers > 1:
+            _apple_translator = AppleTranslatorPool(workers)
+        else:
+            _apple_translator = AppleTranslator()
         print("Apple translator ready.", flush=True)
 
     try:
@@ -751,10 +812,10 @@ def main() -> None:
                     continue
                 issue_dir = EXTRACTS_DIR / pdf_path.parent.name / pdf_path.stem
                 process_pdf(pdf_path, issue_dir, args.dpi, max_pages=args.pages,
-                            flat_dir=flat_dir)
+                            flat_dir=flat_dir, workers=workers)
             print(f"\nFlat folder → {flat_dir}")
         else:
-            process_all(args.dpi, args.pages)
+            process_all(args.dpi, args.pages, workers=workers)
     finally:
         if _apple_translator is not None:
             _apple_translator.close()

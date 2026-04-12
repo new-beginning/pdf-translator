@@ -1,11 +1,12 @@
-// apple_translate — one-shot batch translation using Apple Translation.framework.
+// apple_translate — persistent translation process using Apple Translation.framework.
 //
-// Reads ONE JSON object from stdin, translates, writes ONE JSON object to stdout, exits.
-// Python spawns a fresh process per page — startup is ~0.1s so overhead is negligible,
-// and this avoids main-thread deadlock issues with the framework's async callbacks.
+// Keeps ONE process alive for the entire run. The TranslationSession is created
+// once and reused across all pages, eliminating per-page startup overhead and
+// avoiding daemon contention from multiple concurrent sessions.
 //
-//   stdin : {"texts": ["...", "..."], "source": "en", "target": "vi"}
-//   stdout: {"translations": ["...", "..."]}
+// Protocol: newline-delimited JSON on stdin/stdout.
+//   stdin : {"texts": ["...", "..."], "source": "en", "target": "vi"}\n
+//   stdout: {"translations": ["...", "..."]}\n
 //
 // Compile:
 //   swiftc -O apple_translate.swift -o .apple_translate
@@ -25,37 +26,69 @@ private struct BatchOutput: Encodable {
     let translations: [String]
 }
 
-let inputData = FileHandle.standardInput.readDataToEndOfFile()
-guard let input = try? JSONDecoder().decode(BatchInput.self, from: inputData) else {
-    FileHandle.standardError.write(Data("apple_translate: invalid input\n".utf8))
-    exit(1)
-}
+private var cachedSession: TranslationSession?
+private var cachedSource = ""
+private var cachedTarget = ""
 
-var exitCode: Int32 = 0
-let semaphore = DispatchSemaphore(value: 0)
-
-Task {
-    do {
-        let session = TranslationSession(
+@MainActor
+private func handleRequest(_ input: BatchInput) async {
+    // Reuse session when language pair is unchanged
+    if cachedSession == nil || input.source != cachedSource || input.target != cachedTarget {
+        cachedSession = TranslationSession(
             installedSource: Locale.Language(identifier: input.source),
             target: Locale.Language(identifier: input.target)
         )
-        var result = input.texts
-        for (i, text) in input.texts.enumerated() {
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            let response = try await session.translate(trimmed)
-            result[i] = response.targetText
+        cachedSource = input.source
+        cachedTarget = input.target
+    }
+    let session = cachedSession!
+
+    // Build batch requests, preserving original indices via clientIdentifier
+    var result = input.texts
+    var requests: [TranslationSession.Request] = []
+    for (i, text) in input.texts.enumerated() {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { continue }
+        requests.append(.init(sourceText: trimmed, clientIdentifier: "\(i)"))
+    }
+
+    if !requests.isEmpty {
+        do {
+            for try await response in session.translate(batch: requests) {
+                if let idStr = response.clientIdentifier, let i = Int(idStr) {
+                    result[i] = response.targetText
+                }
+            }
+        } catch {
+            FileHandle.standardError.write(Data("apple_translate error: \(error)\n".utf8))
         }
-        let outData = try JSONEncoder().encode(BatchOutput(translations: result))
+    }
+
+    if let outData = try? JSONEncoder().encode(BatchOutput(translations: result)) {
         FileHandle.standardOutput.write(outData)
         FileHandle.standardOutput.write(Data("\n".utf8))
-    } catch {
-        FileHandle.standardError.write(Data("apple_translate error: \(error)\n".utf8))
-        exitCode = 1
     }
-    semaphore.signal()
+
+    // Ready for the next request
+    scheduleRead()
 }
 
-semaphore.wait()
-exit(exitCode)
+func scheduleRead() {
+    DispatchQueue.global(qos: .userInitiated).async {
+        guard let line = readLine(strippingNewline: true), !line.isEmpty else {
+            exit(0)  // EOF — Python closed stdin, clean shutdown
+        }
+        guard let data = line.data(using: .utf8),
+              let input = try? JSONDecoder().decode(BatchInput.self, from: data) else {
+            FileHandle.standardError.write(Data("apple_translate: invalid JSON, skipping\n".utf8))
+            scheduleRead()
+            return
+        }
+        Task { @MainActor in
+            await handleRequest(input)
+        }
+    }
+}
+
+scheduleRead()
+RunLoop.main.run()
